@@ -91,6 +91,116 @@ public sealed class SqliteConfigurationProviderTests
         Assert.Equal("42", root["External:Value"]);
     }
 
+    [Fact]
+    public async Task ConcurrentReadAndUpdateDoesNotThrow()
+    {
+        using var db = new TemporarySqliteDatabase();
+        using var root = CreateConfiguration(db.Path);
+        var configurationOperator = root.GetConfigurationOperator();
+
+        await configurationOperator.UpdateAsync("Stress:Key", "initial");
+
+        var ct = TestContext.Current.CancellationToken;
+
+        var readerTask = Task.Run(
+            async () =>
+            {
+                for (var i = 0; i < 2000; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    // ReSharper disable once AccessToDisposedClosure
+                    _ = root["Stress:Key"];
+                    await Task.Yield();
+                }
+            },
+            ct);
+
+        var writerTask = Task.Run(
+            async () =>
+            {
+                for (var i = 0; i < 100; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await configurationOperator.UpdateAsync("Stress:Key", i.ToString(CultureInfo.InvariantCulture)).ConfigureAwait(true);
+                }
+            },
+            ct);
+
+        await Task.WhenAll(readerTask, writerTask).ConfigureAwait(true);
+
+        Assert.Equal("99", root["Stress:Key"]);
+    }
+
+    [Fact]
+    public async Task UpdateAsyncWithObjectUsesInvariantCultureForDouble()
+    {
+        var previousCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            using var db = new TemporarySqliteDatabase();
+            using var root = CreateConfiguration(db.Path);
+            var configurationOperator = root.GetConfigurationOperator();
+
+            await configurationOperator.UpdateAsync("Culture:Double", 3.14);
+
+            var stored = (string?)GetValue(db.Path, "Culture:Double");
+            Assert.Equal("3.14", stored);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = previousCulture;
+        }
+    }
+
+    [Fact]
+    public async Task UpdateAsyncWithObjectUsesInvariantCultureForDateTime()
+    {
+        var previousCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            using var db = new TemporarySqliteDatabase();
+            using var root = CreateConfiguration(db.Path);
+            var configurationOperator = root.GetConfigurationOperator();
+
+            var dt = new DateTime(2024, 1, 15, 10, 30, 0, DateTimeKind.Utc);
+            await configurationOperator.UpdateAsync("Culture:DateTime", dt);
+
+            await configurationOperator.ReloadAsync();
+
+            var stored = root["Culture:DateTime"];
+            Assert.NotNull(stored);
+            Assert.DoesNotContain(".", stored, StringComparison.Ordinal);
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = previousCulture;
+        }
+    }
+
+    [Fact]
+    public async Task UpdateAsyncWithNullObjectPreservesNull()
+    {
+        using var db = new TemporarySqliteDatabase();
+        using var root = CreateConfiguration(db.Path);
+        var configurationOperator = root.GetConfigurationOperator();
+
+        await configurationOperator.UpdateAsync("Null:Key", "initial");
+        Assert.Equal("initial", root["Null:Key"]);
+
+        await configurationOperator.UpdateAsync("Null:Key", (object?)null);
+
+        var stored = GetValue(db.Path, "Null:Key");
+        Assert.Equal(DBNull.Value, stored);
+
+        await configurationOperator.ReloadAsync();
+
+        Assert.Null(root["Null:Key"]);
+    }
+
     //--------------------------------------------------------------------------------
     // Helper
     //--------------------------------------------------------------------------------

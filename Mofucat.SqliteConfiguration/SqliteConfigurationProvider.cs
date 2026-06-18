@@ -1,6 +1,7 @@
 namespace Mofucat.SqliteConfiguration;
 
 using System.Data.Common;
+using System.Globalization;
 
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
@@ -64,7 +65,7 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     //--------------------------------------------------------------------------------
 
     public ValueTask UpdateAsync(string key, object? value) =>
-        UpdateAsync(key, value?.ToString());
+        UpdateAsync(key, value is null ? null : Convert.ToString(value, CultureInfo.InvariantCulture));
 
     public async ValueTask UpdateAsync(string key, string? value)
     {
@@ -100,7 +101,7 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 
         foreach (var pair in source)
         {
-            var stringValue = pair.Value?.ToString();
+            var stringValue = pair.Value is null ? null : Convert.ToString(pair.Value, CultureInfo.InvariantCulture);
             await ExecuteUpdateAsync(con, tx, pair.Key, stringValue).ConfigureAwait(false);
             updated[pair.Key] = stringValue;
         }
