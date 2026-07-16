@@ -40,10 +40,8 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         connectionString = builder.ConnectionString;
 
         selectSql = $"SELECT Key, Value FROM {quotedTableName} ORDER BY Key";
-        updateSql = $"REPLACE INTO {quotedTableName} (Key, Value) VALUES (@Key, @Value)";
+        updateSql = $"INSERT INTO {quotedTableName} (Key, Value) VALUES (@Key, @Value) ON CONFLICT(Key) DO UPDATE SET Value = excluded.Value";
         deleteSql = $"DELETE FROM {quotedTableName} WHERE Key = @Key";
-
-        InitializeDatabase();
     }
 
     //--------------------------------------------------------------------------------
@@ -52,6 +50,8 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 
     public override void Load()
     {
+        InitializeDatabase();
+
         var data = LoadData();
 
         lock (sync)
@@ -64,17 +64,17 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     // Operator
     //--------------------------------------------------------------------------------
 
-    public ValueTask UpdateAsync(string key, object? value) =>
-        UpdateAsync(key, value is null ? null : Convert.ToString(value, CultureInfo.InvariantCulture));
+    public ValueTask UpdateAsync(string key, object? value, CancellationToken cancel = default) =>
+        UpdateAsync(key, ConvertValue(value), cancel);
 
-    public async ValueTask UpdateAsync(string key, string? value)
+    public async ValueTask UpdateAsync(string key, string? value, CancellationToken cancel = default)
     {
 #pragma warning disable CA2007
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
-        await con.OpenAsync().ConfigureAwait(false);
+        await con.OpenAsync(cancel).ConfigureAwait(false);
 
-        await ExecuteUpdateAsync(con, null, key, value).ConfigureAwait(false);
+        await ExecuteUpdateAsync(con, null, key, value, cancel).ConfigureAwait(false);
 
         lock (sync)
         {
@@ -87,30 +87,29 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     public ValueTask BulkUpdateAsync(params KeyValuePair<string, object?>[] source) =>
         BulkUpdateAsync((IEnumerable<KeyValuePair<string, object?>>)source);
 
-    public async ValueTask BulkUpdateAsync(IEnumerable<KeyValuePair<string, object?>> source)
+    public async ValueTask BulkUpdateAsync(IEnumerable<KeyValuePair<string, object?>> source, CancellationToken cancel = default)
     {
 #pragma warning disable CA2007
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
-        await con.OpenAsync().ConfigureAwait(false);
+        await con.OpenAsync(cancel).ConfigureAwait(false);
 #pragma warning disable CA2007
-        await using var tx = await con.BeginTransactionAsync().ConfigureAwait(false);
+        await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
 #pragma warning restore CA2007
 
-        var updated = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-
+        var applied = new List<KeyValuePair<string, string?>>();
         foreach (var pair in source)
         {
-            var stringValue = pair.Value is null ? null : Convert.ToString(pair.Value, CultureInfo.InvariantCulture);
-            await ExecuteUpdateAsync(con, tx, pair.Key, stringValue).ConfigureAwait(false);
-            updated[pair.Key] = stringValue;
+            var value = ConvertValue(pair.Value);
+            await ExecuteUpdateAsync(con, tx, pair.Key, value, cancel).ConfigureAwait(false);
+            applied.Add(new(pair.Key, value));
         }
 
-        await tx.CommitAsync().ConfigureAwait(false);
+        await tx.CommitAsync(cancel).ConfigureAwait(false);
 
         lock (sync)
         {
-            foreach (var pair in updated)
+            foreach (var pair in applied)
             {
                 Data[pair.Key] = pair.Value;
             }
@@ -119,14 +118,14 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         OnReload();
     }
 
-    public async ValueTask DeleteAsync(string key)
+    public async ValueTask DeleteAsync(string key, CancellationToken cancel = default)
     {
 #pragma warning disable CA2007
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
-        await con.OpenAsync().ConfigureAwait(false);
+        await con.OpenAsync(cancel).ConfigureAwait(false);
 
-        await ExecuteDeleteAsync(con, null, key).ConfigureAwait(false);
+        await ExecuteDeleteAsync(con, null, key, cancel).ConfigureAwait(false);
 
         lock (sync)
         {
@@ -139,34 +138,28 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     public ValueTask BulkDeleteAsync(params string[] keys) =>
         BulkDeleteAsync((IEnumerable<string>)keys);
 
-    public async ValueTask BulkDeleteAsync(IEnumerable<string> keys)
+    public async ValueTask BulkDeleteAsync(IEnumerable<string> keys, CancellationToken cancel = default)
     {
 #pragma warning disable CA2007
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
-        await con.OpenAsync().ConfigureAwait(false);
+        await con.OpenAsync(cancel).ConfigureAwait(false);
 #pragma warning disable CA2007
-        await using var tx = await con.BeginTransactionAsync().ConfigureAwait(false);
+        await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
 #pragma warning restore CA2007
 
-        var deleted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
+        var applied = new List<string>();
         foreach (var key in keys)
         {
-            await ExecuteDeleteAsync(con, tx, key).ConfigureAwait(false);
-            _ = deleted.Add(key);
+            await ExecuteDeleteAsync(con, tx, key, cancel).ConfigureAwait(false);
+            applied.Add(key);
         }
 
-        if (deleted.Count == 0)
-        {
-            return;
-        }
-
-        await tx.CommitAsync().ConfigureAwait(false);
+        await tx.CommitAsync(cancel).ConfigureAwait(false);
 
         lock (sync)
         {
-            foreach (var key in deleted)
+            foreach (var key in applied)
             {
                 Data.Remove(key);
             }
@@ -175,9 +168,9 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         OnReload();
     }
 
-    public async ValueTask ReloadAsync()
+    public async ValueTask ReloadAsync(CancellationToken cancel = default)
     {
-        var data = await LoadDataAsync().ConfigureAwait(false);
+        var data = await LoadDataAsync(cancel).ConfigureAwait(false);
 
         lock (sync)
         {
@@ -190,6 +183,9 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     //--------------------------------------------------------------------------------
     // Helper
     //--------------------------------------------------------------------------------
+
+    private static string? ConvertValue(object? value) =>
+        value is null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
 
     private static void AddParameter(DbCommand command, string name, object? value)
     {
@@ -228,14 +224,14 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         return data;
     }
 
-    private async ValueTask<Dictionary<string, string?>> LoadDataAsync()
+    private async ValueTask<Dictionary<string, string?>> LoadDataAsync(CancellationToken cancel)
     {
         var data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
 #pragma warning disable CA2007
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
-        await con.OpenAsync().ConfigureAwait(false);
+        await con.OpenAsync(cancel).ConfigureAwait(false);
 
 #pragma warning disable CA2007
         await using var cmd = con.CreateCommand();
@@ -243,9 +239,9 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         cmd.CommandText = selectSql;
 
 #pragma warning disable CA2007
-        await using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
+        await using var reader = await cmd.ExecuteReaderAsync(cancel).ConfigureAwait(false);
 #pragma warning restore CA2007
-        while (await reader.ReadAsync().ConfigureAwait(false))
+        while (await reader.ReadAsync(cancel).ConfigureAwait(false))
         {
 #pragma warning disable CA1849
             data[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
@@ -255,7 +251,7 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         return data;
     }
 
-    private async ValueTask ExecuteUpdateAsync(DbConnection connection, DbTransaction? transaction, string key, string? value)
+    private async ValueTask ExecuteUpdateAsync(DbConnection connection, DbTransaction? transaction, string key, string? value, CancellationToken cancel)
     {
 #pragma warning disable CA2007
         await using var cmd = connection.CreateCommand();
@@ -264,10 +260,10 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         cmd.Transaction = transaction;
         AddParameter(cmd, "Key", key);
         AddParameter(cmd, "Value", value);
-        _ = await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+        _ = await cmd.ExecuteNonQueryAsync(cancel).ConfigureAwait(false);
     }
 
-    private async ValueTask ExecuteDeleteAsync(DbConnection connection, DbTransaction? transaction, string key)
+    private async ValueTask ExecuteDeleteAsync(DbConnection connection, DbTransaction? transaction, string key, CancellationToken cancel)
     {
 #pragma warning disable CA2007
         await using var cmd = connection.CreateCommand();
@@ -275,7 +271,7 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         cmd.CommandText = deleteSql;
         cmd.Transaction = transaction;
         AddParameter(cmd, "Key", key);
-        _ = await cmd.ExecuteNonQueryAsync().ConfigureAwait(false);
+        _ = await cmd.ExecuteNonQueryAsync(cancel).ConfigureAwait(false);
     }
 }
 #pragma warning restore CA2100

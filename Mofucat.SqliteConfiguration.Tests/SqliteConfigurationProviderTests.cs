@@ -22,13 +22,14 @@ public sealed class SqliteConfigurationProviderTests
         using var db = new TemporarySqliteDatabase();
         using var root = CreateConfiguration(db.Path);
         var configurationOperator = root.GetConfigurationOperator();
+        var cancel = TestContext.Current.CancellationToken;
 
-        await configurationOperator.UpdateAsync("Dynamic:Value1", "Updated");
+        await configurationOperator.UpdateAsync("Dynamic:Value1", "Updated", cancel);
 
         Assert.Equal("Updated", root["dynamic:value1"]);
         Assert.Equal("Updated", GetValue(db.Path, "Dynamic:Value1"));
 
-        await configurationOperator.DeleteAsync("Dynamic:Value1");
+        await configurationOperator.DeleteAsync("Dynamic:Value1", cancel);
 
         Assert.Null(root["Dynamic:Value1"]);
         Assert.Null(GetValue(db.Path, "Dynamic:Value1"));
@@ -60,13 +61,14 @@ public sealed class SqliteConfigurationProviderTests
         using var db = new TemporarySqliteDatabase();
         using var root = CreateConfiguration(db.Path);
         var configurationOperator = root.GetConfigurationOperator();
+        var cancel = TestContext.Current.CancellationToken;
 
-        await configurationOperator.BulkUpdateAsync(CreateEntries());
+        await configurationOperator.BulkUpdateAsync(CreateEntries(), cancel);
 
         Assert.Equal("1", root["Lazy:A"]);
         Assert.Equal("2", root["Lazy:B"]);
 
-        await configurationOperator.BulkDeleteAsync(CreateKeys());
+        await configurationOperator.BulkDeleteAsync(CreateKeys(), cancel);
 
         Assert.Null(root["Lazy:A"]);
         Assert.Null(root["Lazy:B"]);
@@ -78,6 +80,7 @@ public sealed class SqliteConfigurationProviderTests
         using var db = new TemporarySqliteDatabase();
         using var root = CreateConfiguration(db.Path);
         var configurationOperator = root.GetConfigurationOperator();
+        var cancel = TestContext.Current.CancellationToken;
 
         await using (var con = OpenConnection(db.Path))
         {
@@ -86,7 +89,7 @@ public sealed class SqliteConfigurationProviderTests
 
         Assert.Null(root["External:Value"]);
 
-        await configurationOperator.ReloadAsync();
+        await configurationOperator.ReloadAsync(cancel);
 
         Assert.Equal("42", root["External:Value"]);
     }
@@ -97,34 +100,33 @@ public sealed class SqliteConfigurationProviderTests
         using var db = new TemporarySqliteDatabase();
         using var root = CreateConfiguration(db.Path);
         var configurationOperator = root.GetConfigurationOperator();
+        var cancel = TestContext.Current.CancellationToken;
 
-        await configurationOperator.UpdateAsync("Stress:Key", "initial");
-
-        var ct = TestContext.Current.CancellationToken;
+        await configurationOperator.UpdateAsync("Stress:Key", "initial", cancel);
 
         var readerTask = Task.Run(
             async () =>
             {
                 for (var i = 0; i < 2000; i++)
                 {
-                    ct.ThrowIfCancellationRequested();
+                    cancel.ThrowIfCancellationRequested();
                     // ReSharper disable once AccessToDisposedClosure
                     _ = root["Stress:Key"];
                     await Task.Yield();
                 }
             },
-            ct);
+            cancel);
 
         var writerTask = Task.Run(
             async () =>
             {
                 for (var i = 0; i < 100; i++)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    await configurationOperator.UpdateAsync("Stress:Key", i.ToString(CultureInfo.InvariantCulture)).ConfigureAwait(true);
+                    cancel.ThrowIfCancellationRequested();
+                    await configurationOperator.UpdateAsync("Stress:Key", i.ToString(CultureInfo.InvariantCulture), cancel).ConfigureAwait(true);
                 }
             },
-            ct);
+            cancel);
 
         await Task.WhenAll(readerTask, writerTask).ConfigureAwait(true);
 
@@ -142,8 +144,9 @@ public sealed class SqliteConfigurationProviderTests
             using var db = new TemporarySqliteDatabase();
             using var root = CreateConfiguration(db.Path);
             var configurationOperator = root.GetConfigurationOperator();
+            var cancel = TestContext.Current.CancellationToken;
 
-            await configurationOperator.UpdateAsync("Culture:Double", 3.14);
+            await configurationOperator.UpdateAsync("Culture:Double", 3.14, cancel);
 
             var stored = (string?)GetValue(db.Path, "Culture:Double");
             Assert.Equal("3.14", stored);
@@ -165,11 +168,12 @@ public sealed class SqliteConfigurationProviderTests
             using var db = new TemporarySqliteDatabase();
             using var root = CreateConfiguration(db.Path);
             var configurationOperator = root.GetConfigurationOperator();
+            var cancel = TestContext.Current.CancellationToken;
 
             var dt = new DateTime(2024, 1, 15, 10, 30, 0, DateTimeKind.Utc);
-            await configurationOperator.UpdateAsync("Culture:DateTime", dt);
+            await configurationOperator.UpdateAsync("Culture:DateTime", dt, cancel);
 
-            await configurationOperator.ReloadAsync();
+            await configurationOperator.ReloadAsync(cancel);
 
             var stored = root["Culture:DateTime"];
             Assert.NotNull(stored);
@@ -187,18 +191,33 @@ public sealed class SqliteConfigurationProviderTests
         using var db = new TemporarySqliteDatabase();
         using var root = CreateConfiguration(db.Path);
         var configurationOperator = root.GetConfigurationOperator();
+        var cancel = TestContext.Current.CancellationToken;
 
-        await configurationOperator.UpdateAsync("Null:Key", "initial");
+        await configurationOperator.UpdateAsync("Null:Key", "initial", cancel);
         Assert.Equal("initial", root["Null:Key"]);
 
-        await configurationOperator.UpdateAsync("Null:Key", (object?)null);
+        await configurationOperator.UpdateAsync("Null:Key", (object?)null, cancel);
 
         var stored = GetValue(db.Path, "Null:Key");
         Assert.Equal(DBNull.Value, stored);
 
-        await configurationOperator.ReloadAsync();
+        await configurationOperator.ReloadAsync(cancel);
 
         Assert.Null(root["Null:Key"]);
+    }
+
+    [Fact]
+    public async Task UpdateAsyncWithCanceledTokenThrows()
+    {
+        using var db = new TemporarySqliteDatabase();
+        using var root = CreateConfiguration(db.Path);
+        var configurationOperator = root.GetConfigurationOperator();
+
+        using var cancels = new CancellationTokenSource();
+        await cancels.CancelAsync();
+
+        _ = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => configurationOperator.UpdateAsync("Cancel:Key", "value", cancels.Token).AsTask());
     }
 
     //--------------------------------------------------------------------------------
