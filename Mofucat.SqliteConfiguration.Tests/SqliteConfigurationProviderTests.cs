@@ -46,8 +46,8 @@ public sealed class SqliteConfigurationProviderTests
             new KeyValuePair<string, object?>("Feature:A", true),
             new KeyValuePair<string, object?>("Feature:B", false));
 
-        Assert.Equal("True", root["Feature:A"]);
-        Assert.Equal("False", root["Feature:B"]);
+        Assert.Equal("true", root["Feature:A"]);
+        Assert.Equal("false", root["Feature:B"]);
 
         await configurationOperator.BulkDeleteAsync("Feature:A", "Feature:B");
 

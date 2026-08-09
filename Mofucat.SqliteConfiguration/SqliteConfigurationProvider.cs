@@ -1,5 +1,6 @@
 namespace Mofucat.SqliteConfiguration;
 
+using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Globalization;
 
@@ -7,13 +8,11 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 
 #pragma warning disable CA2100
-internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConfigurationOperator
+internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConfigurationOperator, IDisposable
 {
-#if NET9_0_OR_GREATER
-    private readonly Lock sync = new();
-#else
-    private readonly object sync = new();
-#endif
+    private readonly ConcurrentDictionary<string, string?> store = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly SemaphoreSlim sync = new(1, 1);
 
     private readonly string connectionString;
 
@@ -29,6 +28,8 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 
     public SqliteConfigurationProvider(SqliteConfigurationOptions options)
     {
+        Data = store;
+
         quotedTableName = $"\"{options.Table.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
         var builder = new SqliteConnectionStringBuilder
@@ -44,6 +45,11 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         deleteSql = $"DELETE FROM {quotedTableName} WHERE Key = @Key";
     }
 
+    public void Dispose()
+    {
+        sync.Dispose();
+    }
+
     //--------------------------------------------------------------------------------
     // Override
     //--------------------------------------------------------------------------------
@@ -52,11 +58,14 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     {
         InitializeDatabase();
 
-        var data = LoadData();
-
-        lock (sync)
+        sync.Wait();
+        try
         {
-            Data = data;
+            ApplySnapshot(LoadData());
+        }
+        finally
+        {
+            _ = sync.Release();
         }
     }
 
@@ -74,11 +83,16 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 #pragma warning restore CA2007
         await con.OpenAsync(cancel).ConfigureAwait(false);
 
-        await ExecuteUpdateAsync(con, null, key, value, cancel).ConfigureAwait(false);
-
-        lock (sync)
+        await sync.WaitAsync(cancel).ConfigureAwait(false);
+        try
         {
-            Data[key] = value;
+            await ExecuteUpdateAsync(con, null, key, value, cancel).ConfigureAwait(false);
+
+            store[key] = value;
+        }
+        finally
+        {
+            _ = sync.Release();
         }
 
         OnReload();
@@ -93,26 +107,31 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
         await con.OpenAsync(cancel).ConfigureAwait(false);
+        await sync.WaitAsync(cancel).ConfigureAwait(false);
+        try
+        {
 #pragma warning disable CA2007
-        await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
+            await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
 #pragma warning restore CA2007
 
-        var applied = new List<KeyValuePair<string, string?>>();
-        foreach (var pair in source)
-        {
-            var value = ConvertValue(pair.Value);
-            await ExecuteUpdateAsync(con, tx, pair.Key, value, cancel).ConfigureAwait(false);
-            applied.Add(new(pair.Key, value));
-        }
+            var applied = new List<KeyValuePair<string, string?>>();
+            foreach (var pair in source)
+            {
+                var value = ConvertValue(pair.Value);
+                await ExecuteUpdateAsync(con, tx, pair.Key, value, cancel).ConfigureAwait(false);
+                applied.Add(new(pair.Key, value));
+            }
 
-        await tx.CommitAsync(cancel).ConfigureAwait(false);
+            await tx.CommitAsync(cancel).ConfigureAwait(false);
 
-        lock (sync)
-        {
             foreach (var pair in applied)
             {
-                Data[pair.Key] = pair.Value;
+                store[pair.Key] = pair.Value;
             }
+        }
+        finally
+        {
+            _ = sync.Release();
         }
 
         OnReload();
@@ -125,11 +144,16 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 #pragma warning restore CA2007
         await con.OpenAsync(cancel).ConfigureAwait(false);
 
-        await ExecuteDeleteAsync(con, null, key, cancel).ConfigureAwait(false);
-
-        lock (sync)
+        await sync.WaitAsync(cancel).ConfigureAwait(false);
+        try
         {
-            Data.Remove(key);
+            await ExecuteDeleteAsync(con, null, key, cancel).ConfigureAwait(false);
+
+            _ = store.TryRemove(key, out _);
+        }
+        finally
+        {
+            _ = sync.Release();
         }
 
         OnReload();
@@ -144,25 +168,30 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
         await using var con = new SqliteConnection(connectionString);
 #pragma warning restore CA2007
         await con.OpenAsync(cancel).ConfigureAwait(false);
+        await sync.WaitAsync(cancel).ConfigureAwait(false);
+        try
+        {
 #pragma warning disable CA2007
-        await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
+            await using var tx = await con.BeginTransactionAsync(cancel).ConfigureAwait(false);
 #pragma warning restore CA2007
 
-        var applied = new List<string>();
-        foreach (var key in keys)
-        {
-            await ExecuteDeleteAsync(con, tx, key, cancel).ConfigureAwait(false);
-            applied.Add(key);
-        }
+            var applied = new List<string>();
+            foreach (var key in keys)
+            {
+                await ExecuteDeleteAsync(con, tx, key, cancel).ConfigureAwait(false);
+                applied.Add(key);
+            }
 
-        await tx.CommitAsync(cancel).ConfigureAwait(false);
+            await tx.CommitAsync(cancel).ConfigureAwait(false);
 
-        lock (sync)
-        {
             foreach (var key in applied)
             {
-                Data.Remove(key);
+                _ = store.TryRemove(key, out _);
             }
+        }
+        finally
+        {
+            _ = sync.Release();
         }
 
         OnReload();
@@ -170,14 +199,33 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
 
     public async ValueTask ReloadAsync(CancellationToken cancel = default)
     {
-        var data = await LoadDataAsync(cancel).ConfigureAwait(false);
-
-        lock (sync)
+        await sync.WaitAsync(cancel).ConfigureAwait(false);
+        try
         {
-            Data = data;
+            ApplySnapshot(await LoadDataAsync(cancel).ConfigureAwait(false));
+        }
+        finally
+        {
+            _ = sync.Release();
         }
 
         OnReload();
+    }
+
+    private void ApplySnapshot(Dictionary<string, string?> snapshot)
+    {
+        foreach (var pair in snapshot)
+        {
+            store[pair.Key] = pair.Value;
+        }
+
+        foreach (var key in store.Keys)
+        {
+            if (!snapshot.ContainsKey(key))
+            {
+                _ = store.TryRemove(key, out _);
+            }
+        }
     }
 
     //--------------------------------------------------------------------------------
@@ -185,7 +233,12 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     //--------------------------------------------------------------------------------
 
     private static string? ConvertValue(object? value) =>
-        value is null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+        value switch
+        {
+            null => null,
+            bool b => b ? "true" : "false",
+            _ => Convert.ToString(value, CultureInfo.InvariantCulture)
+        };
 
     private static void AddParameter(DbCommand command, string name, object? value)
     {
@@ -199,6 +252,10 @@ internal sealed class SqliteConfigurationProvider : ConfigurationProvider, IConf
     {
         using var con = new SqliteConnection(connectionString);
         con.Open();
+
+        using var pragma = con.CreateCommand();
+        pragma.CommandText = "PRAGMA journal_mode=WAL";
+        _ = pragma.ExecuteScalar();
 
         using var cmd = con.CreateCommand();
         cmd.CommandText = $"CREATE TABLE IF NOT EXISTS {quotedTableName} (Key TEXT NOT NULL COLLATE NOCASE PRIMARY KEY, Value TEXT)";
