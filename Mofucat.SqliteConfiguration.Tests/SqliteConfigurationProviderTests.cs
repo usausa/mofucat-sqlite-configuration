@@ -289,12 +289,7 @@ public sealed class SqliteConfigurationProviderTests
 
     private sealed class TemporarySqliteDatabase : IDisposable
     {
-        public TemporarySqliteDatabase()
-        {
-            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
-        }
-
-        public string Path { get; }
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"{Guid.NewGuid():N}.db");
 
         public void Dispose()
         {
